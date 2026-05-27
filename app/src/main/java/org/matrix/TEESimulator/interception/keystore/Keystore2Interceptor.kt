@@ -9,6 +9,7 @@ import android.system.keystore2.Domain
 import android.system.keystore2.IKeystoreService
 import android.system.keystore2.KeyDescriptor
 import android.system.keystore2.KeyEntryResponse
+import android.system.keystore2.KeyMetadata
 import java.security.SecureRandom
 import java.security.cert.Certificate
 import java.util.concurrent.ConcurrentHashMap
@@ -202,17 +203,22 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         ) {
             logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
 
-            if (ConfigurationManager.shouldSkipUid(callingUid))
-                return TransactionResult.ContinueAndSkipPost
+            val skipUid = ConfigurationManager.shouldSkipUid(callingUid)
 
-            if (code == UPDATE_SUBCOMPONENT_TRANSACTION)
+            if (code == UPDATE_SUBCOMPONENT_TRANSACTION) {
+                if (skipUid) return TransactionResult.ContinueAndSkipPost
                 return handleUpdateSubcomponent(callingUid, data)
+            }
 
-            if (code == GRANT_TRANSACTION)
+            if (code == GRANT_TRANSACTION) {
+                if (skipUid) return TransactionResult.ContinueAndSkipPost
                 return handleGrant(txId, callingUid, data)
+            }
 
-            if (code == UNGRANT_TRANSACTION)
+            if (code == UNGRANT_TRANSACTION) {
+                if (skipUid) return TransactionResult.ContinueAndSkipPost
                 return handleUngrant(callingUid, data)
+            }
 
             data.enforceInterface(IKeystoreService.DESCRIPTOR)
             val descriptor =
@@ -220,6 +226,9 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     ?: return TransactionResult.ContinueAndSkipPost
 
             if (code == DELETE_KEY_TRANSACTION) {
+                if (skipUid)
+                    return TransactionResult.ContinueAndSkipPost
+
                 val keyId =
                     if (descriptor.alias != null) {
                         KeyIdentifier(callingUid, descriptor.alias)
@@ -258,13 +267,18 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     SystemLogger.info(
                         "[TX_ID: $txId] Resolved GRANT nspace=${descriptor.nspace} to ${ownerKeyId}"
                     )
-                    return InterceptorUtils.createTypedObjectReply(response)
+                    return InterceptorUtils.createTypedObjectReply(
+                        responseForDescriptor(response, descriptor)
+                    )
                 }
                 SystemLogger.debug(
                     "[TX_ID: $txId] No cached response for GRANT nspace=${descriptor.nspace}; forwarding"
                 )
                 return TransactionResult.ContinueAndSkipPost
             }
+
+            if (skipUid)
+                return TransactionResult.ContinueAndSkipPost
 
             if (descriptor.alias == null) {
                 if (descriptor.domain == Domain.KEY_ID) {
@@ -640,20 +654,29 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
             ?: return TransactionResult.ContinueAndSkipPost
 
-        val generatedKeyInfo =
-            when (descriptor.domain) {
-                Domain.KEY_ID ->
-                    KeyMintSecurityLevelInterceptor.findGeneratedKeyByKeyId(
-                        callingUid, descriptor.nspace
-                    )
-                Domain.APP ->
-                    descriptor.alias?.let {
-                        KeyMintSecurityLevelInterceptor.generatedKeys[KeyIdentifier(callingUid, it)]
-                    }
-                else -> null
-            }
+        val keyId = resolveKeyIdentifier(callingUid, descriptor)
+        val generatedKeyInfo = keyId?.let {
+            KeyMintSecurityLevelInterceptor.generatedKeys[it]
+        }
+
+        val publicCert = data.createByteArray()
+        val certificateChain = data.createByteArray()
+
+        val cachedTeeResponse = keyId?.let {
+            KeyMintSecurityLevelInterceptor.teeResponses[it]
+        }
 
         if (generatedKeyInfo == null) {
+            if (keyId != null && cachedTeeResponse != null) {
+                SystemLogger.info("Updating cached TEE sub-component with key[${descriptor.nspace}]")
+                cachedTeeResponse.metadata?.let { metadata ->
+                    metadata.certificate = publicCert
+                    metadata.certificateChain = certificateChain
+                }
+                KeyMintSecurityLevelInterceptor.patchedChains.remove(keyId)
+                return TransactionResult.ContinueAndSkipPost
+            }
+
             descriptor.alias?.let {
                 val kid = KeyIdentifier(callingUid, it)
                 userUpdatedKeys.add(kid)
@@ -664,8 +687,6 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
         SystemLogger.info("Updating sub-component with key[${generatedKeyInfo.nspace}]")
         val metadata = generatedKeyInfo.response.metadata
-        val publicCert = data.createByteArray()
-        val certificateChain = data.createByteArray()
 
         metadata.certificate = publicCert
         metadata.certificateChain = certificateChain
@@ -677,5 +698,34 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         )
 
         return InterceptorUtils.createSuccessReply(writeResultCode = false)
+    }
+
+    private fun responseForDescriptor(
+        response: KeyEntryResponse,
+        descriptor: KeyDescriptor,
+    ): KeyEntryResponse {
+        return KeyEntryResponse().apply {
+            metadata = cloneMetadata(response.metadata)?.also { metadata ->
+                metadata.key = KeyDescriptor().apply {
+                    domain = descriptor.domain
+                    nspace = descriptor.nspace
+                    alias = descriptor.alias
+                    blob = descriptor.blob?.clone()
+                }
+            }
+            iSecurityLevel = response.iSecurityLevel
+        }
+    }
+
+    private fun cloneMetadata(metadata: KeyMetadata?): KeyMetadata? {
+        metadata ?: return null
+        val parcel = Parcel.obtain()
+        return try {
+            metadata.writeToParcel(parcel, 0)
+            parcel.setDataPosition(0)
+            KeyMetadata.CREATOR.createFromParcel(parcel)
+        } finally {
+            parcel.recycle()
+        }
     }
 }
