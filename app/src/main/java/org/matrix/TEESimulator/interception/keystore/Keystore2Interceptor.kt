@@ -40,6 +40,10 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         InterceptorUtils.getTransactCode(stubBinderClass, "deleteKey")
     private val UPDATE_SUBCOMPONENT_TRANSACTION =
         InterceptorUtils.getTransactCode(stubBinderClass, "updateSubcomponent")
+    private val GRANT_TRANSACTION =
+        InterceptorUtils.getTransactCode(stubBinderClass, "grant")
+    private val UNGRANT_TRANSACTION =
+        InterceptorUtils.getTransactCode(stubBinderClass, "ungrant")
     private val LIST_ENTRIES_TRANSACTION =
         InterceptorUtils.getTransactCode(stubBinderClass, "listEntries")
     private val LIST_ENTRIES_BATCHED_TRANSACTION =
@@ -59,13 +63,32 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     }
 
     private const val RESPONSE_KEY_NOT_FOUND = 7
+    private data class PendingGrant(val ownerKeyId: KeyIdentifier, val granteeUid: Int)
+
     private val deletedSoftwareKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
     private val userUpdatedKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
+    private val pendingGrants = ConcurrentHashMap<Long, PendingGrant>()
+    private val grantOwnersByNspace = ConcurrentHashMap<Long, KeyIdentifier>()
 
     fun forgetDeletedKey(keyId: KeyIdentifier) {
         if (deletedSoftwareKeys.remove(keyId)) {
             SystemLogger.debug("Cleared deletion marker for ${keyId.alias}")
         }
+    }
+
+    fun forgetGrantsForKey(keyId: KeyIdentifier) {
+        val grantIds = grantOwnersByNspace
+            .filterValues { it == keyId }
+            .keys
+        grantIds.forEach { grantOwnersByNspace.remove(it) }
+        if (grantIds.isNotEmpty()) {
+            SystemLogger.debug("Cleared ${grantIds.size} grant mappings for ${keyId.alias}")
+        }
+    }
+
+    fun resolveGrantOwner(nspace: Long?): KeyIdentifier? {
+        if (nspace == null || nspace == 0L) return null
+        return grantOwnersByNspace[nspace]
     }
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
@@ -77,6 +100,8 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 GET_KEY_ENTRY_TRANSACTION,
                 DELETE_KEY_TRANSACTION,
                 UPDATE_SUBCOMPONENT_TRANSACTION,
+                GRANT_TRANSACTION,
+                UNGRANT_TRANSACTION,
                 LIST_ENTRIES_TRANSACTION,
                 LIST_ENTRIES_BATCHED_TRANSACTION,
                 GET_NUMBER_OF_ENTRIES_TRANSACTION,
@@ -171,7 +196,9 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         } else if (
             code == GET_KEY_ENTRY_TRANSACTION ||
                 code == DELETE_KEY_TRANSACTION ||
-                code == UPDATE_SUBCOMPONENT_TRANSACTION
+                code == UPDATE_SUBCOMPONENT_TRANSACTION ||
+                code == GRANT_TRANSACTION ||
+                code == UNGRANT_TRANSACTION
         ) {
             logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
 
@@ -180,6 +207,12 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
             if (code == UPDATE_SUBCOMPONENT_TRANSACTION)
                 return handleUpdateSubcomponent(callingUid, data)
+
+            if (code == GRANT_TRANSACTION)
+                return handleGrant(txId, callingUid, data)
+
+            if (code == UNGRANT_TRANSACTION)
+                return handleUngrant(callingUid, data)
 
             data.enforceInterface(IKeystoreService.DESCRIPTOR)
             val descriptor =
@@ -204,6 +237,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     val isSoftwareKey =
                         KeyMintSecurityLevelInterceptor.generatedKeys.containsKey(keyId)
                     KeyMintSecurityLevelInterceptor.cleanupKeyData(keyId)
+                    forgetGrantsForKey(keyId)
                     if (isSoftwareKey) {
                         deletedSoftwareKeys.add(keyId)
                         SystemLogger.info(
@@ -212,6 +246,23 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         return InterceptorUtils.createSuccessReply(writeResultCode = false)
                     }
                 }
+                return TransactionResult.ContinueAndSkipPost
+            }
+
+            if (descriptor.domain == Domain.GRANT) {
+                val ownerKeyId = resolveGrantOwner(descriptor.nspace)
+                val response = ownerKeyId?.let {
+                    KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(it)
+                }
+                if (response != null) {
+                    SystemLogger.info(
+                        "[TX_ID: $txId] Resolved GRANT nspace=${descriptor.nspace} to ${ownerKeyId}"
+                    )
+                    return InterceptorUtils.createTypedObjectReply(response)
+                }
+                SystemLogger.debug(
+                    "[TX_ID: $txId] No cached response for GRANT nspace=${descriptor.nspace}; forwarding"
+                )
                 return TransactionResult.ContinueAndSkipPost
             }
 
@@ -295,9 +346,34 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     ): TransactionResult {
         if (target != keystoreService || reply == null) return TransactionResult.SkipTransaction
         if (InterceptorUtils.hasException(reply)) {
+            if (code == GRANT_TRANSACTION) pendingGrants.remove(txId)
             val normalized = InterceptorUtils.normalizeServiceSpecificReply(reply)
             return if (normalized != null) TransactionResult.OverrideReply(normalized)
             else TransactionResult.SkipTransaction
+        }
+
+        if (code == GRANT_TRANSACTION) {
+            logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
+
+            return runCatching {
+                    val pending = pendingGrants.remove(txId)
+                        ?: return TransactionResult.SkipTransaction
+                    val grantDescriptor = reply.readTypedObject(KeyDescriptor.CREATOR)
+                        ?: return TransactionResult.SkipTransaction
+                    if (grantDescriptor.domain == Domain.GRANT && grantDescriptor.nspace != 0L) {
+                        grantOwnersByNspace[grantDescriptor.nspace] = pending.ownerKeyId
+                        SystemLogger.info(
+                            "[TX_ID: $txId] Recorded grant nspace=${grantDescriptor.nspace} " +
+                                "for ${pending.ownerKeyId} -> uid=${pending.granteeUid}"
+                        )
+                    }
+                    TransactionResult.SkipTransaction
+                }
+                .getOrElse {
+                    pendingGrants.remove(txId)
+                    SystemLogger.error("[TX_ID: $txId] Failed to record grant mapping.", it)
+                    TransactionResult.SkipTransaction
+                }
         }
 
         if (code == GET_NUMBER_OF_ENTRIES_TRANSACTION) {
@@ -369,21 +445,9 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     SystemLogger.trace { "[TRACE-$txId] getKeyEntry $keyId: isImport=${parsedParameters.isImportKey()} origin=${parsedParameters.origin} inImportedKeys=${KeyMintSecurityLevelInterceptor.importedKeys.contains(keyId)} hasPatchedChain=${KeyMintSecurityLevelInterceptor.getPatchedChain(keyId) != null} isAttestKey=${parsedParameters.isAttestKey()}" }
 
                     if (parsedParameters.isImportKey()) {
-                        val retainedChain = KeyMintSecurityLevelInterceptor.getPatchedChain(keyId)
-                        if (retainedChain == null) {
-                            SystemLogger.trace { "[TRACE-$txId] getKeyEntry $keyId: imported, no retained chain, skip" }
-                            SystemLogger.info("[TX_ID: $txId] Skip patching for imported key (no prior attestation).")
-                            return TransactionResult.SkipTransaction
-                        }
-                        SystemLogger.trace { "[TRACE-$txId] getKeyEntry $keyId: imported, SERVING RETAINED CHAIN (detection vector!)" }
-                        SystemLogger.info("[TX_ID: $txId] Imported key overwrote attested alias, serving retained chain for $keyId")
-                        CertificateHelper.updateCertificateChain(response.metadata, retainedChain).getOrThrow()
-                        response.metadata.authorizations =
-                            InterceptorUtils.patchAuthorizations(
-                                response.metadata.authorizations,
-                                callingUid,
-                            )
-                        return InterceptorUtils.createTypedObjectReply(response)
+                        SystemLogger.trace { "[TRACE-$txId] getKeyEntry $keyId: imported key, skip patching" }
+                        SystemLogger.info("[TX_ID: $txId] Skip patching for imported key $keyId.")
+                        return TransactionResult.SkipTransaction
                     }
 
                     if (KeyMintSecurityLevelInterceptor.importedKeys.contains(keyId)) {
@@ -506,6 +570,69 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 }
         }
         return TransactionResult.SkipTransaction
+    }
+
+    private fun handleGrant(
+        txId: Long,
+        callingUid: Int,
+        data: Parcel,
+    ): TransactionResult {
+        return runCatching {
+                data.enforceInterface(IKeystoreService.DESCRIPTOR)
+                val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                    ?: return TransactionResult.ContinueAndSkipPost
+                val granteeUid = data.readInt()
+                val ownerKeyId = resolveKeyIdentifier(callingUid, descriptor)
+
+                if (ownerKeyId != null) {
+                    pendingGrants[txId] = PendingGrant(ownerKeyId, granteeUid)
+                    SystemLogger.debug(
+                        "[TX_ID: $txId] Tracking grant request for ${ownerKeyId} -> uid=$granteeUid"
+                    )
+                }
+
+                TransactionResult.Continue
+            }
+            .getOrElse {
+                SystemLogger.error("[TX_ID: $txId] Failed to parse grant request.", it)
+                TransactionResult.ContinueAndSkipPost
+            }
+    }
+
+    private fun handleUngrant(callingUid: Int, data: Parcel): TransactionResult {
+        return runCatching {
+                data.enforceInterface(IKeystoreService.DESCRIPTOR)
+                val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                    ?: return TransactionResult.ContinueAndSkipPost
+
+                if (descriptor.domain == Domain.GRANT && descriptor.nspace != 0L) {
+                    grantOwnersByNspace.remove(descriptor.nspace)
+                } else {
+                    resolveKeyIdentifier(callingUid, descriptor)?.let { forgetGrantsForKey(it) }
+                }
+
+                TransactionResult.ContinueAndSkipPost
+            }
+            .getOrElse {
+                SystemLogger.error("Failed to parse ungrant request.", it)
+                TransactionResult.ContinueAndSkipPost
+            }
+    }
+
+    private fun resolveKeyIdentifier(
+        callingUid: Int,
+        descriptor: KeyDescriptor,
+    ): KeyIdentifier? {
+        return when (descriptor.domain) {
+            Domain.APP -> descriptor.alias?.let { KeyIdentifier(callingUid, it) }
+            Domain.KEY_ID ->
+                KeyMintSecurityLevelInterceptor.findKeyIdentifierByKeyId(
+                    callingUid,
+                    descriptor.nspace,
+                )
+            Domain.GRANT -> resolveGrantOwner(descriptor.nspace)
+            else -> null
+        }
     }
 
     private fun handleUpdateSubcomponent(callingUid: Int, data: Parcel): TransactionResult {

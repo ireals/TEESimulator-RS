@@ -126,38 +126,12 @@ class KeyMintSecurityLevelInterceptor(
             val keyDescriptor =
                 data.readTypedObject(KeyDescriptor.CREATOR)
                     ?: return TransactionResult.SkipTransaction
-            // Evict generated key data but retain patched chains so detectors
-            // can't use importKey to force unpatched getKeyEntry responses.
             val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
-            if (generatedKeys.remove(keyId) != null) {
-                SystemLogger.debug("Remove generated key on importKey $keyId")
-                GeneratedKeyPersistence.delete(keyId)
-            }
-            attestationKeys.remove(keyId)
+            cleanupKeyData(keyId)
+            Keystore2Interceptor.forgetGrantsForKey(keyId)
             importedKeys.add(keyId)
-            SystemLogger.trace { "[TRACE-$txId] post-importKey $keyId: added to importedKeys, skipUid=${ConfigurationManager.shouldSkipUid(callingUid)}" }
-
-            if (!ConfigurationManager.shouldSkipUid(callingUid)) {
-                val metadata: KeyMetadata =
-                    reply.readTypedObject(KeyMetadata.CREATOR)
-                        ?: return TransactionResult.SkipTransaction
-                val originalChain = CertificateHelper.getCertificateChain(metadata)
-                SystemLogger.trace { "[TRACE-$txId] post-importKey $keyId: chainSize=${originalChain?.size ?: 0}" }
-                if (originalChain != null && originalChain.size > 1) {
-                    val newChain = AttestationPatcher.patchCertificateChain(originalChain, callingUid)
-                    CertificateHelper.updateCertificateChain(metadata, newChain).getOrThrow()
-                    metadata.authorizations =
-                        InterceptorUtils.patchAuthorizations(metadata.authorizations, callingUid)
-                    patchedChains[keyId] = newChain
-                    teeResponses[keyId] = KeyEntryResponse().apply {
-                        this.metadata = metadata
-                        iSecurityLevel = original
-                    }
-                    SystemLogger.trace { "[TRACE-$txId] post-importKey $keyId: PATCHED chain (chainSize=${newChain.size})" }
-                    SystemLogger.debug("Cached patched certificate chain for imported key $keyId.")
-                    return InterceptorUtils.createTypedObjectReply(metadata)
-                }
-            }
+            SystemLogger.trace { "[TRACE-$txId] post-importKey $keyId: cleared generated state and marked imported" }
+            return TransactionResult.SkipTransaction
         } else if (code == CREATE_OPERATION_TRANSACTION) {
             logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
 
@@ -318,6 +292,19 @@ class KeyMintSecurityLevelInterceptor(
                         trackAndEnforceOpLimit(callingUid, txId)?.let { return it }
                         SystemLogger.info("[TX_ID: $txId] createOperation KeyId(${keyDescriptor.nspace}) NOT FOUND for uid=$callingUid. Forwarding to HAL.")
                         return TransactionResult.Continue
+                    }
+                }
+                Domain.GRANT -> {
+                    val ownerKeyId = Keystore2Interceptor.resolveGrantOwner(keyDescriptor.nspace)
+                        ?: run {
+                            SystemLogger.info("[TX_ID: $txId] createOperation GRANT(${keyDescriptor.nspace}) NOT FOUND. Forwarding to HAL.")
+                            return TransactionResult.ContinueAndSkipPost
+                        }
+                    generatedKeys[ownerKeyId]?.let {
+                        java.util.AbstractMap.SimpleEntry(ownerKeyId, it)
+                    } ?: run {
+                        SystemLogger.info("[TX_ID: $txId] createOperation GRANT(${keyDescriptor.nspace}) owner $ownerKeyId is not software-backed. Forwarding to HAL.")
+                        return TransactionResult.ContinueAndSkipPost
                     }
                 }
                 else -> {
@@ -1166,6 +1153,18 @@ class KeyMintSecurityLevelInterceptor(
                 .filter { (keyIdentifier, _) -> keyIdentifier.uid == callingUid }
                 .find { (_, info) -> info.nspace == nspace }
                 ?.value
+        }
+
+        fun findKeyIdentifierByKeyId(callingUid: Int, nspace: Long?): KeyIdentifier? {
+            if (nspace == null || nspace == 0L) return null
+            return generatedKeys.entries
+                .filter { (keyIdentifier, _) -> keyIdentifier.uid == callingUid }
+                .find { (_, info) -> info.nspace == nspace }
+                ?.key
+                ?: teeResponses.entries
+                    .filter { (keyId, _) -> keyId.uid == callingUid }
+                    .find { (_, response) -> response.metadata?.key?.nspace == nspace }
+                    ?.key
         }
 
         fun findTeeResponseByKeyId(callingUid: Int, nspace: Long?): KeyEntryResponse? {
