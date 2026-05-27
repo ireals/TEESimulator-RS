@@ -63,13 +63,27 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             .associate { field -> (field.get(null) as Int) to field.name.split("_")[1] }
     }
 
+    private const val RESPONSE_PERMISSION_DENIED = 6
     private const val RESPONSE_KEY_NOT_FOUND = 7
-    private data class PendingGrant(val ownerKeyId: KeyIdentifier, val granteeUid: Int)
+    private const val KEY_PERMISSION_GET_INFO = 0x4
+    private const val KEY_PERMISSION_USE = 0x100
+
+    private data class GrantMapping(
+        val ownerKeyId: KeyIdentifier,
+        val granteeUid: Int,
+        val accessVector: Int,
+    )
+
+    private data class PendingGrant(
+        val ownerKeyId: KeyIdentifier,
+        val granteeUid: Int,
+        val accessVector: Int,
+    )
 
     private val deletedSoftwareKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
     private val userUpdatedKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
     private val pendingGrants = ConcurrentHashMap<Long, PendingGrant>()
-    private val grantOwnersByNspace = ConcurrentHashMap<Long, KeyIdentifier>()
+    private val grantsByNspace = ConcurrentHashMap<Long, GrantMapping>()
 
     fun forgetDeletedKey(keyId: KeyIdentifier) {
         if (deletedSoftwareKeys.remove(keyId)) {
@@ -78,10 +92,10 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     }
 
     fun forgetGrantsForKey(keyId: KeyIdentifier) {
-        val grantIds = grantOwnersByNspace
-            .filterValues { it == keyId }
+        val grantIds = grantsByNspace
+            .filterValues { it.ownerKeyId == keyId }
             .keys
-        grantIds.forEach { grantOwnersByNspace.remove(it) }
+        grantIds.forEach { grantsByNspace.remove(it) }
         if (grantIds.isNotEmpty()) {
             SystemLogger.debug("Cleared ${grantIds.size} grant mappings for ${keyId.alias}")
         }
@@ -89,8 +103,27 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
     fun resolveGrantOwner(nspace: Long?): KeyIdentifier? {
         if (nspace == null || nspace == 0L) return null
-        return grantOwnersByNspace[nspace]
+        return grantsByNspace[nspace]?.ownerKeyId
     }
+
+    fun resolveGrantOwnerForUse(nspace: Long?, callingUid: Int): KeyIdentifier? {
+        val grant = resolveGrant(nspace) ?: return null
+        if (!grant.allowsCaller(callingUid) || !grant.allowsUse()) return null
+        return grant.ownerKeyId
+    }
+
+    private fun resolveGrant(nspace: Long?): GrantMapping? {
+        if (nspace == null || nspace == 0L) return null
+        return grantsByNspace[nspace]
+    }
+
+    private fun GrantMapping.allowsCaller(uid: Int): Boolean = granteeUid == uid
+
+    private fun GrantMapping.allowsGetInfo(): Boolean =
+        accessVector and KEY_PERMISSION_GET_INFO != 0
+
+    private fun GrantMapping.allowsUse(): Boolean =
+        accessVector and KEY_PERMISSION_USE != 0
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
@@ -259,13 +292,27 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             }
 
             if (descriptor.domain == Domain.GRANT) {
-                val ownerKeyId = resolveGrantOwner(descriptor.nspace)
-                val response = ownerKeyId?.let {
+                val grant = resolveGrant(descriptor.nspace)
+                if (grant != null && !grant.allowsCaller(callingUid)) {
+                    SystemLogger.info(
+                        "[TX_ID: $txId] Rejecting GRANT nspace=${descriptor.nspace} " +
+                            "for non-grantee uid=$callingUid expected=${grant.granteeUid}"
+                    )
+                    return InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
+                }
+                if (grant != null && !grant.allowsGetInfo()) {
+                    SystemLogger.info(
+                        "[TX_ID: $txId] Rejecting GRANT nspace=${descriptor.nspace} " +
+                            "for uid=$callingUid without GET_INFO access"
+                    )
+                    return InterceptorUtils.createErrorReply(RESPONSE_PERMISSION_DENIED)
+                }
+                val response = grant?.ownerKeyId?.let {
                     KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(it)
                 }
                 if (response != null) {
                     SystemLogger.info(
-                        "[TX_ID: $txId] Resolved GRANT nspace=${descriptor.nspace} to ${ownerKeyId}"
+                        "[TX_ID: $txId] Resolved GRANT nspace=${descriptor.nspace} to ${grant.ownerKeyId}"
                     )
                     return InterceptorUtils.createTypedObjectReply(
                         responseForDescriptor(response, descriptor)
@@ -375,10 +422,15 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     val grantDescriptor = reply.readTypedObject(KeyDescriptor.CREATOR)
                         ?: return TransactionResult.SkipTransaction
                     if (grantDescriptor.domain == Domain.GRANT && grantDescriptor.nspace != 0L) {
-                        grantOwnersByNspace[grantDescriptor.nspace] = pending.ownerKeyId
+                        grantsByNspace[grantDescriptor.nspace] = GrantMapping(
+                            ownerKeyId = pending.ownerKeyId,
+                            granteeUid = pending.granteeUid,
+                            accessVector = pending.accessVector,
+                        )
                         SystemLogger.info(
                             "[TX_ID: $txId] Recorded grant nspace=${grantDescriptor.nspace} " +
-                                "for ${pending.ownerKeyId} -> uid=${pending.granteeUid}"
+                                "for ${pending.ownerKeyId} -> uid=${pending.granteeUid} " +
+                                "accessVector=0x${pending.accessVector.toString(16)}"
                         )
                     }
                     TransactionResult.SkipTransaction
@@ -596,12 +648,14 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
                     ?: return TransactionResult.ContinueAndSkipPost
                 val granteeUid = data.readInt()
+                val accessVector = data.readInt()
                 val ownerKeyId = resolveKeyIdentifier(callingUid, descriptor)
 
                 if (ownerKeyId != null) {
-                    pendingGrants[txId] = PendingGrant(ownerKeyId, granteeUid)
+                    pendingGrants[txId] = PendingGrant(ownerKeyId, granteeUid, accessVector)
                     SystemLogger.debug(
-                        "[TX_ID: $txId] Tracking grant request for ${ownerKeyId} -> uid=$granteeUid"
+                        "[TX_ID: $txId] Tracking grant request for ${ownerKeyId} -> " +
+                            "uid=$granteeUid accessVector=0x${accessVector.toString(16)}"
                     )
                 }
 
@@ -620,7 +674,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     ?: return TransactionResult.ContinueAndSkipPost
 
                 if (descriptor.domain == Domain.GRANT && descriptor.nspace != 0L) {
-                    grantOwnersByNspace.remove(descriptor.nspace)
+                    grantsByNspace.remove(descriptor.nspace)
                 } else {
                     resolveKeyIdentifier(callingUid, descriptor)?.let { forgetGrantsForKey(it) }
                 }
@@ -644,7 +698,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     callingUid,
                     descriptor.nspace,
                 )
-            Domain.GRANT -> resolveGrantOwner(descriptor.nspace)
+            Domain.GRANT -> resolveGrantOwnerForUse(descriptor.nspace, callingUid)
             else -> null
         }
     }

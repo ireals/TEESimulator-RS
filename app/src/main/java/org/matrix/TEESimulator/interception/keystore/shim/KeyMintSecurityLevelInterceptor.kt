@@ -295,7 +295,10 @@ class KeyMintSecurityLevelInterceptor(
                     }
                 }
                 Domain.GRANT -> {
-                    val ownerKeyId = Keystore2Interceptor.resolveGrantOwner(keyDescriptor.nspace)
+                    val ownerKeyId = Keystore2Interceptor.resolveGrantOwnerForUse(
+                        keyDescriptor.nspace,
+                        callingUid,
+                    )
                         ?: run {
                             SystemLogger.info("[TX_ID: $txId] createOperation GRANT(${keyDescriptor.nspace}) NOT FOUND. Forwarding to HAL.")
                             return TransactionResult.ContinueAndSkipPost
